@@ -2,6 +2,7 @@ import asyncio
 import csv
 import logging
 import sys
+import time
 from dataclasses import astuple, dataclass, fields
 from urllib.parse import urljoin
 
@@ -108,6 +109,7 @@ async def process_single_page(
         quotes_divs = page_soup.select(".quote")
         quotes = []
         new_authors = []
+        author_tasks = []
 
         for quote_div in quotes_divs:
             quote = parse_single_quote(quote_div)
@@ -115,15 +117,46 @@ async def process_single_page(
 
             if quote.author not in author_cache:
                 author_url = get_author_url(quote_div)
-                author_content = await get_page_content(session, author_url)
-                author_soup = BeautifulSoup(author_content, "html.parser")
-                author = parse_author_bio(author_soup)
-                author_cache[quote.author] = author
-                new_authors.append(author)
-                logging.info(f"Collected biography for {quote.author}")
+                task = asyncio.create_task(
+                    get_page_content(session, author_url)
+                )
+                author_tasks.append((quote.author, task))
+
+        for author_name, task in author_tasks:
+            author_content = await task
+            author_soup = BeautifulSoup(author_content, "html.parser")
+            author = parse_author_bio(author_soup)
+            author_cache[author_name] = author
+            new_authors.append(author)
+            logging.info(f"Collected biography for {author_name}")
 
         next_url = get_next_page_url(page_soup)
         return quotes, next_url, new_authors
+
+
+async def get_page_urls(
+    session: aiohttp.ClientSession, semaphore: asyncio.Semaphore
+) -> list[str]:
+    """Get all page URLs concurrently."""
+    urls = []
+
+    async with semaphore:
+        current_url = BASE_URL
+
+        while current_url:
+            content = await get_page_content(session, current_url)
+            soup = BeautifulSoup(content, "html.parser")
+
+            if current_url != BASE_URL:
+                urls.append(current_url)
+
+            next_link = soup.select_one("li.next a")
+            if not next_link:
+                break
+
+            current_url = urljoin(BASE_URL, next_link["href"])
+
+        return urls
 
 
 async def get_all_quotes() -> tuple[list[Quote], list[Author]]:
@@ -141,18 +174,8 @@ async def get_all_quotes() -> tuple[list[Quote], list[Author]]:
         )
         all_quotes.extend(first_page[0])
         all_authors.extend(first_page[2])
-        next_url = first_page[1]
 
-        page_urls = []
-        page_number = 2
-        current_url = next_url
-
-        while current_url:
-            page_urls.append(current_url)
-            page_content = await get_page_content(session, current_url)
-            page_soup = BeautifulSoup(page_content, "html.parser")
-            current_url = get_next_page_url(page_soup)
-            page_number += 1
+        page_urls = await get_page_urls(session, semaphore)
 
         if page_urls:
             tasks = [
@@ -209,4 +232,7 @@ def main(
 
 
 if __name__ == "__main__":
+    start_time = time.time()
     main()
+    execution_time = time.time() - start_time
+    logging.info(f"Total execution time: {execution_time:.2f} seconds")  # noqa
